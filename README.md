@@ -358,5 +358,5 @@ Contributions welcome. Run `cargo test && cargo clippy -- -W clippy::all && carg
 ---
 
 <p align="center">
-  <sub>MIT License · Built by <a href="https://github.com/aoinoikaz">GondolaBros</a></sub>
+  <sub>MIT License · Built by <a href="https://github.com/aoinoikaz">Gondola Bros Entertainment</a></sub>
 </p>
