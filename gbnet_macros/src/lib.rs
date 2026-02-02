@@ -4,6 +4,8 @@ use syn::{
     parse_macro_input, Data, DeriveInput, Field, Fields, GenericParam, Generics, Index, Type,
 };
 
+mod delta;
+
 // ─── Constants ─────────────────────────────────────────────────────────────
 
 const MAX_BIT_WIDTH: usize = 64;
@@ -57,6 +59,69 @@ fn get_max_len(field: &Field, input: &DeriveInput) -> Option<usize> {
                 .find(|attr| attr.path().is_ident("default_max_len"))
                 .and_then(|attr| parse_lit_int(&attr.meta))
         })
+}
+
+fn get_with_path(field: &Field) -> Option<syn::Path> {
+    field.attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("with") {
+            return None;
+        }
+        if let syn::Meta::NameValue(syn::MetaNameValue {
+            value:
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }),
+            ..
+        }) = &attr.meta
+        {
+            s.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn get_skip_if(field: &Field) -> Option<syn::Expr> {
+    field.attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("skip_if") {
+            return None;
+        }
+        if let syn::Meta::NameValue(syn::MetaNameValue {
+            value:
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }),
+            ..
+        }) = &attr.meta
+        {
+            s.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn get_variant_id(variant: &syn::Variant) -> Option<u64> {
+    variant.attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("variant_id") {
+            return None;
+        }
+        if let syn::Meta::NameValue(syn::MetaNameValue {
+            value:
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(lit),
+                    ..
+                }),
+            ..
+        }) = &attr.meta
+        {
+            lit.base10_parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn is_byte_aligned(field: &Field) -> bool {
@@ -252,6 +317,11 @@ fn gen_bit_serialize_field(
     input: &DeriveInput,
     is_ref: bool,
 ) -> proc_macro2::TokenStream {
+    // #[with = "path"] overrides all default serialization
+    if let Some(path) = get_with_path(field) {
+        return quote! { #path::bit_serialize(&#value_expr, writer)?; };
+    }
+
     let bits = get_field_bit_width(field, defaults);
     let max_len = get_max_len(field, input);
 
@@ -342,6 +412,10 @@ fn gen_byte_serialize_field(
     defaults: &[(String, usize)],
     is_ref: bool,
 ) -> proc_macro2::TokenStream {
+    if let Some(path) = get_with_path(field) {
+        return quote! { #path::byte_aligned_serialize(&#value_expr, writer)?; };
+    }
+
     let bits = get_field_bit_width(field, defaults);
     let deref = if is_ref {
         quote! { * }
@@ -384,6 +458,10 @@ fn gen_bit_deserialize_field(
     defaults: &[(String, usize)],
     input: &DeriveInput,
 ) -> proc_macro2::TokenStream {
+    if let Some(path) = get_with_path(field) {
+        return quote! { let #var_name = #path::bit_deserialize(reader)?; };
+    }
+
     let bits = get_field_bit_width(field, defaults);
     let max_len = get_max_len(field, input);
 
@@ -461,6 +539,10 @@ fn gen_byte_deserialize_field(
     field: &Field,
     defaults: &[(String, usize)],
 ) -> proc_macro2::TokenStream {
+    if let Some(path) = get_with_path(field) {
+        return quote! { let #var_name = #path::byte_aligned_deserialize(reader)?; };
+    }
+
     let bits = get_field_bit_width(field, defaults);
     if bits > 0 {
         match type_ident_name(&field.ty).as_deref() {
@@ -535,11 +617,29 @@ fn gen_field_serialize(
 ) -> proc_macro2::TokenStream {
     let ba = is_byte_aligned(field);
     let code = if is_bit {
-        gen_bit_serialize_field(field, value_expr, label, defaults, input, is_ref)
+        gen_bit_serialize_field(field, value_expr.clone(), label, defaults, input, is_ref)
     } else {
-        gen_byte_serialize_field(field, value_expr, defaults, is_ref)
+        gen_byte_serialize_field(field, value_expr.clone(), defaults, is_ref)
     };
-    wrap_byte_align_write(is_bit, ba, code)
+    let code = wrap_byte_align_write(is_bit, ba, code);
+
+    // Wrap with skip_if presence bit (bit mode only)
+    if let Some(skip_expr) = get_skip_if(field) {
+        if is_bit {
+            quote! {
+                if !(#skip_expr) {
+                    writer.write_bit(true)?;
+                    #code
+                } else {
+                    writer.write_bit(false)?;
+                }
+            }
+        } else {
+            code
+        }
+    } else {
+        code
+    }
 }
 
 fn gen_field_deserialize(
@@ -556,14 +656,38 @@ fn gen_field_deserialize(
     } else {
         gen_byte_deserialize_field(var_name, field, defaults)
     };
-    wrap_byte_align_read(is_bit, ba, code)
+    let code = wrap_byte_align_read(is_bit, ba, code);
+
+    // Wrap with skip_if presence bit (bit mode only)
+    if get_skip_if(field).is_some() && is_bit {
+        quote! {
+            let #var_name = if reader.read_bit()? {
+                #code
+                #var_name
+            } else {
+                Default::default()
+            };
+        }
+    } else {
+        code
+    }
 }
 
 // ─── Derive entry point ────────────────────────────────────────────────────
 
 #[proc_macro_derive(
     NetworkSerialize,
-    attributes(no_serialize, bits, max_len, byte_align, default_bits, default_max_len)
+    attributes(
+        no_serialize,
+        bits,
+        max_len,
+        byte_align,
+        default_bits,
+        default_max_len,
+        with,
+        skip_if,
+        variant_id
+    )
 )]
 pub fn derive_network_serialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -828,13 +952,31 @@ fn gen_enum_serialize(
     let defaults = get_default_bits(input);
     let bits = enum_variant_bits(data, input);
 
+    // Validate variant_id: no duplicates, fits in bit width
+    let mut pinned_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for variant in &data.variants {
+        if let Some(id) = get_variant_id(variant) {
+            if !pinned_ids.insert(id) {
+                panic!("Duplicate #[variant_id = {}] on enum variant", id);
+            }
+            let max_val = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            if id > max_val {
+                panic!("#[variant_id = {}] exceeds {} bits", id, bits);
+            }
+        }
+    }
+
     let arms: Vec<_> = data
         .variants
         .iter()
         .enumerate()
         .map(|(i, variant)| {
             let vname = &variant.ident;
-            let vidx = i as u64;
+            let vidx = get_variant_id(variant).unwrap_or(i as u64);
             let write_idx = enum_write_variant_index(is_bit, bits, vidx);
 
             match &variant.fields {
@@ -924,7 +1066,7 @@ fn gen_enum_deserialize(
         .enumerate()
         .map(|(i, variant)| {
             let vname = &variant.ident;
-            let vidx = i as u64;
+            let vidx = get_variant_id(variant).unwrap_or(i as u64);
 
             match &variant.fields {
                 Fields::Named(fields) => {
@@ -1014,4 +1156,12 @@ fn gen_enum_deserialize(
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown variant index")),
         }
     }
+}
+
+// ─── NetworkDelta derive ────────────────────────────────────────────────────
+
+#[proc_macro_derive(NetworkDelta, attributes(bits))]
+pub fn derive_network_delta(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    TokenStream::from(delta::derive_network_delta_impl(&input))
 }

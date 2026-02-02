@@ -64,6 +64,7 @@ pub struct Channel {
     bytes_sent: u64,
     bytes_received: u64,
     gap_sequences_skipped: u64,
+    messages_dropped: u64,
 }
 
 impl Channel {
@@ -83,6 +84,7 @@ impl Channel {
             bytes_sent: 0,
             bytes_received: 0,
             gap_sequences_skipped: 0,
+            messages_dropped: 0,
         }
     }
 
@@ -259,6 +261,7 @@ impl Channel {
         if let Some(evicted_seq) = oldest_seq {
             self.ordered_receive_buffer.remove(&evicted_seq);
             self.gap_sequences_skipped += 1;
+            self.messages_dropped += 1;
 
             // If the evicted entry was what we were waiting for, advance
             if evicted_seq == self.receive_sequence {
@@ -349,6 +352,7 @@ impl Channel {
         self.bytes_sent = 0;
         self.bytes_received = 0;
         self.gap_sequences_skipped = 0;
+        self.messages_dropped = 0;
     }
 
     pub fn is_reliable(&self) -> bool {
@@ -382,6 +386,15 @@ impl Channel {
             pending_ack_count: self.pending_ack.len(),
             receive_buffer_size: self.ordered_receive_buffer.len(),
             gap_sequences_skipped: self.gap_sequences_skipped,
+            messages_dropped: self.messages_dropped,
+        }
+    }
+
+    /// Mark a message for fast retransmit by resetting its send_time,
+    /// causing it to be retransmitted on the next `get_retransmit_messages()` call.
+    pub fn mark_for_fast_retransmit(&mut self, seq: u16) {
+        if let Some(msg) = self.pending_ack.get_mut(&seq) {
+            msg.send_time = Some(Instant::now() - std::time::Duration::from_secs(60));
         }
     }
 

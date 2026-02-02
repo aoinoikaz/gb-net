@@ -1,13 +1,13 @@
 //! Connection state machine for reliable UDP: handshake, channels,
 //! reliability tracking, congestion control, and fragmentation.
 use rand::random;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use crate::{
     channel::{Channel, ChannelError},
-    congestion::{BandwidthTracker, CongestionController},
+    congestion::{BandwidthTracker, CongestionController, CongestionWindow},
     fragment::{FragmentAssembler, MtuDiscovery},
     packet::{Packet, PacketHeader},
     reliability::ReliableEndpoint,
@@ -116,7 +116,7 @@ pub struct Connection {
 
     pub(crate) local_sequence: u16,
     pub(crate) remote_sequence: u16,
-    pub(crate) ack_bits: u32,
+    pub(crate) ack_bits: u64,
     pub(crate) reliability: ReliableEndpoint,
 
     pub(crate) channels: Vec<Channel>,
@@ -125,6 +125,7 @@ pub struct Connection {
     pub(crate) recv_queue: VecDeque<Packet>,
 
     pub(crate) congestion: CongestionController,
+    pub(crate) cwnd: Option<CongestionWindow>,
     pub(crate) bandwidth_up: BandwidthTracker,
     pub(crate) bandwidth_down: BandwidthTracker,
     pub(crate) fragment_assembler: FragmentAssembler,
@@ -139,6 +140,13 @@ pub struct Connection {
 
     pub(crate) disconnect_retry_count: u32,
     pub(crate) disconnect_time: Option<Instant>,
+
+    pub(crate) pending_ack_send: bool,
+    pub(crate) data_sent_this_tick: bool,
+    pub(crate) next_fragment_id: u32,
+    /// Tracks per-fragment packet sequences for selective retransmission.
+    /// Maps fragment_message_id → Vec<(packet_seq, fragment_index, fragment_data)>
+    pub(crate) pending_fragments: HashMap<u32, Vec<(u16, u8, Vec<u8>)>>,
 }
 
 impl Connection {
@@ -169,6 +177,11 @@ impl Connection {
             config.congestion_good_rtt_threshold,
             config.congestion_recovery_time,
         );
+        let cwnd = if config.use_cwnd_congestion {
+            Some(CongestionWindow::new(config.mtu))
+        } else {
+            None
+        };
         let bandwidth_up = BandwidthTracker::new(std::time::Duration::from_secs(1));
         let bandwidth_down = BandwidthTracker::new(std::time::Duration::from_secs(1));
         let fragment_assembler =
@@ -200,6 +213,7 @@ impl Connection {
             channels,
             channel_priority_order,
             congestion,
+            cwnd,
             bandwidth_up,
             bandwidth_down,
             fragment_assembler,
@@ -211,6 +225,10 @@ impl Connection {
             stats: NetworkStats::default(),
             disconnect_retry_count: 0,
             disconnect_time: None,
+            pending_ack_send: false,
+            data_sent_this_tick: false,
+            next_fragment_id: 0,
+            pending_fragments: HashMap::new(),
         }
     }
 
@@ -279,6 +297,16 @@ impl Connection {
         &self.config
     }
 
+    /// Token for connection migration validation: XOR of client and server salts.
+    pub fn migration_token(&self) -> u64 {
+        self.client_salt ^ self.server_salt
+    }
+
+    /// Update the remote address (used during connection migration).
+    pub fn set_remote_addr(&mut self, addr: SocketAddr) {
+        self.remote_addr = addr;
+    }
+
     pub fn client_salt(&self) -> u64 {
         self.client_salt
     }
@@ -342,17 +370,38 @@ impl Connection {
 
         self.reliability
             .on_packet_received(header.sequence, Instant::now());
+        self.pending_ack_send = true;
 
         if crate::util::sequence_greater_than(header.sequence, self.remote_sequence) {
             self.remote_sequence = header.sequence;
         }
 
-        let acked_pairs = self.reliability.process_acks(header.ack, header.ack_bits);
+        let (acked_pairs, fast_retransmit) =
+            self.reliability.process_acks(header.ack, header.ack_bits);
+        // Feed ack info to cwnd if enabled
+        if let Some(ref mut cw) = self.cwnd {
+            let acked_bytes = acked_pairs.len() * self.config.mtu;
+            if acked_bytes > 0 {
+                cw.on_ack(acked_bytes);
+            }
+        }
+
         for (channel_id, channel_seq) in acked_pairs {
             if (channel_id as usize) < self.channels.len() {
                 self.channels[channel_id as usize].acknowledge_message(channel_seq);
             }
         }
+        for (channel_id, channel_seq) in fast_retransmit {
+            if (channel_id as usize) < self.channels.len() {
+                self.channels[channel_id as usize].mark_for_fast_retransmit(channel_seq);
+            }
+        }
+
+        // Clean up fully-acked fragment groups
+        self.pending_fragments.retain(|_, entries| {
+            entries.retain(|(pkt_seq, _, _)| self.reliability.is_in_flight(*pkt_seq));
+            !entries.is_empty()
+        });
     }
 
     /// Drain the send queue, returning packets that need to be sent over the wire.

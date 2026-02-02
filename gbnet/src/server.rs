@@ -5,12 +5,12 @@
 use rand::random;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     congestion,
     connection::{Connection, ConnectionState, DisconnectReason},
-    packet::{deny_reason, disconnect_reason, Packet, PacketType},
+    packet::{deny_reason, disconnect_reason, Packet, PacketHeader, PacketType},
     security::{self, ConnectionRateLimiter},
     socket::{SocketError, UdpSocket},
     wire, NetworkConfig, NetworkStats,
@@ -26,6 +26,10 @@ pub enum ServerEvent {
         channel: u8,
         data: Vec<u8>,
     },
+    ClientMigrated {
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+    },
 }
 
 struct PendingConnection {
@@ -37,6 +41,9 @@ struct PendingConnection {
 ///
 /// Call [`NetServer::update`] once per game tick to process packets,
 /// send keepalives, and collect events.
+/// Minimum interval between migrations for the same connection.
+const MIGRATION_COOLDOWN: Duration = Duration::from_secs(5);
+
 pub struct NetServer {
     socket: UdpSocket,
     connections: HashMap<SocketAddr, Connection>,
@@ -44,6 +51,9 @@ pub struct NetServer {
     disconnecting: HashMap<SocketAddr, Connection>,
     config: NetworkConfig,
     rate_limiter: ConnectionRateLimiter,
+    cookie_secret: [u8; 32],
+    /// Tracks last migration time per migration_token to rate-limit migrations.
+    migration_cooldowns: HashMap<u64, Instant>,
 }
 
 impl NetServer {
@@ -54,6 +64,10 @@ impl NetServer {
         }
         let socket = UdpSocket::bind(addr)?;
         let rate_limit = config.rate_limit_per_second;
+        let mut cookie_secret = [0u8; 32];
+        for (i, byte) in cookie_secret.iter_mut().enumerate() {
+            *byte = random::<u8>().wrapping_add(i as u8);
+        }
         Ok(Self {
             socket,
             connections: HashMap::new(),
@@ -61,6 +75,8 @@ impl NetServer {
             disconnecting: HashMap::new(),
             config: config.clone(),
             rate_limiter: ConnectionRateLimiter::new(rate_limit),
+            cookie_secret,
+            migration_cooldowns: HashMap::new(),
         })
     }
 
@@ -157,6 +173,8 @@ impl NetServer {
         let timeout = self.config.connection_request_timeout;
         self.pending.retain(|_, p| p.created_at.elapsed() < timeout);
         self.rate_limiter.cleanup();
+        self.migration_cooldowns
+            .retain(|_, last| last.elapsed() < MIGRATION_COOLDOWN);
 
         events
     }
@@ -229,6 +247,45 @@ impl NetServer {
         self.socket.local_addr()
     }
 
+    /// Attempt to migrate an existing connection to a new address.
+    /// Returns the old address if migration succeeded.
+    fn try_migrate(&mut self, new_addr: SocketAddr, header: &PacketHeader) -> Option<SocketAddr> {
+        if !self.config.enable_connection_migration {
+            return None;
+        }
+
+        let now = Instant::now();
+
+        // Find a connection whose sequence range matches the incoming packet
+        let old_addr = self.connections.iter().find_map(|(addr, conn)| {
+            if conn.state() != ConnectionState::Connected {
+                return None;
+            }
+            // Check sequence is plausible (within reasonable window)
+            let seq_diff = crate::util::sequence_diff(header.sequence, conn.remote_sequence).abs();
+            if seq_diff > conn.config().max_sequence_distance as i32 {
+                return None;
+            }
+            // Check migration cooldown
+            let token = conn.migration_token();
+            if let Some(last) = self.migration_cooldowns.get(&token) {
+                if now.duration_since(*last) < MIGRATION_COOLDOWN {
+                    return None;
+                }
+            }
+            Some(*addr)
+        })?;
+
+        // Perform migration
+        let mut conn = self.connections.remove(&old_addr)?;
+        let token = conn.migration_token();
+        conn.set_remote_addr(new_addr);
+        self.migration_cooldowns.insert(token, now);
+        self.connections.insert(new_addr, conn);
+
+        Some(old_addr)
+    }
+
     fn handle_server_packet(
         &mut self,
         addr: SocketAddr,
@@ -246,6 +303,88 @@ impl NetServer {
                     return;
                 }
 
+                if self.config.enable_stateless_cookie {
+                    // Respond with a cookie instead of allocating state immediately
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        / crate::config::DEFAULT_COOKIE_WINDOW_SECS;
+                    let cookie = security::generate_cookie(&addr, timestamp, &self.cookie_secret);
+                    let (high, low) = security::cookie_to_u64_pair(&cookie);
+                    self.send_raw(
+                        addr,
+                        PacketType::ConnectionCookie {
+                            cookie_high: high,
+                            cookie_low: low,
+                        },
+                    );
+                    return;
+                }
+
+                if let Some(pending) = self.pending.get(&addr) {
+                    self.send_raw(
+                        addr,
+                        PacketType::ConnectionChallenge {
+                            server_salt: pending.server_salt,
+                        },
+                    );
+                    return;
+                }
+
+                if self.pending.len() >= self.config.max_pending {
+                    return;
+                }
+                if self.connections.len() >= self.config.max_clients {
+                    self.send_raw(
+                        addr,
+                        PacketType::ConnectionDeny {
+                            reason: deny_reason::SERVER_FULL,
+                        },
+                    );
+                    return;
+                }
+
+                let server_salt: u64 = random();
+                self.send_raw(addr, PacketType::ConnectionChallenge { server_salt });
+                self.pending.insert(
+                    addr,
+                    PendingConnection {
+                        server_salt,
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+            PacketType::ConnectionRequestWithCookie {
+                cookie_high,
+                cookie_low,
+            } => {
+                if !self.rate_limiter.allow(addr) {
+                    return;
+                }
+
+                if self.connections.contains_key(&addr) {
+                    self.send_raw(addr, PacketType::ConnectionAccept);
+                    return;
+                }
+
+                // Validate the cookie
+                let cookie = security::cookie_from_u64_pair(cookie_high, cookie_low);
+                let current_timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if !security::validate_cookie(
+                    &cookie,
+                    &addr,
+                    current_timestamp,
+                    &self.cookie_secret,
+                    crate::config::DEFAULT_COOKIE_WINDOW_SECS,
+                ) {
+                    return;
+                }
+
+                // Cookie valid — proceed to salt challenge
                 if let Some(pending) = self.pending.get(&addr) {
                     self.send_raw(
                         addr,
@@ -323,22 +462,31 @@ impl NetServer {
                 channel,
                 is_fragment,
             } => {
-                if let Some(conn) = self.connections.get_mut(&addr) {
-                    if packet.payload.len() > conn.config().default_channel_config.max_message_size
+                let effective_addr = if self.connections.contains_key(&addr) {
+                    addr
+                } else if let Some(old_addr) = self.try_migrate(addr, &packet.header) {
+                    events.push(ServerEvent::ClientMigrated {
+                        old_addr,
+                        new_addr: addr,
+                    });
+                    addr
+                } else {
+                    return;
+                };
+                let conn = self.connections.get_mut(&effective_addr).unwrap();
+                if packet.payload.len() > conn.config().default_channel_config.max_message_size {
+                    return;
+                }
+                conn.touch_recv_time();
+                conn.process_incoming_header(&packet.header);
+                if is_fragment {
+                    if let Some(assembled) =
+                        conn.fragment_assembler.process_fragment(&packet.payload)
                     {
-                        return;
+                        conn.receive_payload_direct(channel, assembled);
                     }
-                    conn.touch_recv_time();
-                    conn.process_incoming_header(&packet.header);
-                    if is_fragment {
-                        if let Some(assembled) =
-                            conn.fragment_assembler.process_fragment(&packet.payload)
-                        {
-                            conn.receive_payload_direct(channel, assembled);
-                        }
-                    } else {
-                        conn.receive_payload_direct(channel, packet.payload);
-                    }
+                } else {
+                    conn.receive_payload_direct(channel, packet.payload);
                 }
             }
             PacketType::BatchedPayload { channel } => {
@@ -366,7 +514,7 @@ impl NetServer {
                     conn.mtu_discovery.on_probe_success(probe_size as usize);
                 }
             }
-            PacketType::KeepAlive => {
+            PacketType::KeepAlive | PacketType::AckOnly => {
                 if let Some(conn) = self.connections.get_mut(&addr) {
                     conn.touch_recv_time();
                     conn.process_incoming_header(&packet.header);

@@ -9,10 +9,21 @@ pub const BATCH_HEADER_SIZE: usize = 1;
 pub const BATCH_LENGTH_SIZE: usize = 2;
 pub const MAX_BATCH_MESSAGES: u8 = 255;
 
+pub const INITIAL_CWND_PACKETS: usize = 10;
+pub const MIN_CWND_BYTES: usize = 1200;
+
 pub const MIN_RECOVERY_SECS: f64 = 1.0;
 pub const MAX_RECOVERY_SECS: f64 = 60.0;
 pub const RECOVERY_HALVE_INTERVAL_SECS: f64 = 10.0;
 pub const QUICK_DROP_THRESHOLD_SECS: f64 = 10.0;
+
+/// Phase for window-based congestion control.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CongestionPhase {
+    SlowStart,
+    Avoidance,
+    Recovery,
+}
 
 /// Binary congestion state: either network conditions are acceptable or degraded.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,6 +157,111 @@ impl CongestionController {
     pub fn can_send(&self, packets_sent_this_cycle: u32, packet_bytes: usize) -> bool {
         (packets_sent_this_cycle as f32) < self.current_send_rate
             && self.budget_bytes_remaining >= packet_bytes as i64
+    }
+}
+
+/// Window-based congestion controller with slow start, avoidance, and recovery phases.
+#[derive(Debug)]
+pub struct CongestionWindow {
+    phase: CongestionPhase,
+    cwnd: f64,
+    ssthresh: f64,
+    bytes_in_flight: u64,
+    mtu: usize,
+    last_send_time: Option<Instant>,
+    min_inter_packet_delay: Duration,
+}
+
+impl CongestionWindow {
+    pub fn new(mtu: usize) -> Self {
+        Self {
+            phase: CongestionPhase::SlowStart,
+            cwnd: (INITIAL_CWND_PACKETS * mtu) as f64,
+            ssthresh: f64::MAX,
+            bytes_in_flight: 0,
+            mtu,
+            last_send_time: None,
+            min_inter_packet_delay: Duration::ZERO,
+        }
+    }
+
+    /// Called when bytes are acknowledged.
+    pub fn on_ack(&mut self, bytes: usize) {
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes as u64);
+        match self.phase {
+            CongestionPhase::SlowStart => {
+                self.cwnd += bytes as f64;
+                if self.cwnd >= self.ssthresh {
+                    self.phase = CongestionPhase::Avoidance;
+                }
+            }
+            CongestionPhase::Avoidance => {
+                // Additive increase: cwnd += mtu * bytes / cwnd
+                self.cwnd += (self.mtu as f64) * (bytes as f64) / self.cwnd;
+            }
+            CongestionPhase::Recovery => {
+                // In recovery, be conservative
+            }
+        }
+    }
+
+    /// Called on packet loss detection.
+    pub fn on_loss(&mut self) {
+        self.ssthresh = self.cwnd / 2.0;
+        if self.ssthresh < MIN_CWND_BYTES as f64 {
+            self.ssthresh = MIN_CWND_BYTES as f64;
+        }
+        self.cwnd = self.ssthresh;
+        self.phase = CongestionPhase::Recovery;
+    }
+
+    /// Exit recovery and return to avoidance.
+    pub fn exit_recovery(&mut self) {
+        if self.phase == CongestionPhase::Recovery {
+            self.phase = CongestionPhase::Avoidance;
+        }
+    }
+
+    /// Record bytes sent.
+    pub fn on_send(&mut self, bytes: usize) {
+        self.bytes_in_flight += bytes as u64;
+        self.last_send_time = Some(Instant::now());
+    }
+
+    /// Returns true if a packet of the given size can be sent.
+    pub fn can_send(&self, packet_bytes: usize) -> bool {
+        self.bytes_in_flight + packet_bytes as u64 <= self.cwnd as u64
+    }
+
+    /// Update pacing delay from cwnd and RTT.
+    pub fn update_pacing(&mut self, rtt: Duration) {
+        if self.cwnd > 0.0 && !rtt.is_zero() {
+            let packets_in_window = self.cwnd / self.mtu as f64;
+            if packets_in_window > 0.0 {
+                self.min_inter_packet_delay =
+                    Duration::from_secs_f64(rtt.as_secs_f64() / packets_in_window);
+            }
+        }
+    }
+
+    /// Returns true if enough time has elapsed since the last send for pacing.
+    pub fn can_send_paced(&self, now: Instant) -> bool {
+        match self.last_send_time {
+            Some(last) => now.duration_since(last) >= self.min_inter_packet_delay,
+            None => true,
+        }
+    }
+
+    pub fn phase(&self) -> CongestionPhase {
+        self.phase
+    }
+
+    pub fn cwnd(&self) -> f64 {
+        self.cwnd
+    }
+
+    pub fn bytes_in_flight(&self) -> u64 {
+        self.bytes_in_flight
     }
 }
 

@@ -17,8 +17,8 @@ pub struct PacketHeader {
     pub sequence: u16,
     #[bits = 16]
     pub ack: u16,
-    #[bits = 32]
-    pub ack_bits: u32,
+    #[bits = 64]
+    pub ack_bits: u64,
 }
 
 /// Discriminated packet type encoded in 4 bits (up to 16 variants).
@@ -61,6 +61,19 @@ pub enum PacketType {
     MtuProbeAck {
         #[bits = 16]
         probe_size: u16,
+    },
+    AckOnly,
+    ConnectionCookie {
+        #[bits = 64]
+        cookie_high: u64,
+        #[bits = 64]
+        cookie_low: u64,
+    },
+    ConnectionRequestWithCookie {
+        #[bits = 64]
+        cookie_high: u64,
+        #[bits = 64]
+        cookie_low: u64,
     },
 }
 

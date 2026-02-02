@@ -34,6 +34,9 @@ fn main() {
                         eprintln!("Send error: {}", e);
                     }
                 }
+                ServerEvent::ClientMigrated { old_addr, new_addr } => {
+                    println!("[~] Client migrated: {} -> {}", old_addr, new_addr);
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(16));

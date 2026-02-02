@@ -28,12 +28,12 @@ impl std::fmt::Display for FragmentError {
 
 impl std::error::Error for FragmentError {}
 
-/// Fragment header: message_id (u16) + fragment_index (u8) + fragment_count (u8) = 4 bytes
-pub const FRAGMENT_HEADER_SIZE: usize = 4;
+/// Fragment header: message_id (u32) + fragment_index (u8) + fragment_count (u8) = 6 bytes
+pub const FRAGMENT_HEADER_SIZE: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct FragmentHeader {
-    pub message_id: u16,
+    pub message_id: u32,
     pub fragment_index: u8,
     pub fragment_count: u8,
 }
@@ -44,6 +44,8 @@ impl FragmentHeader {
         [
             id_bytes[0],
             id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
             self.fragment_index,
             self.fragment_count,
         ]
@@ -54,9 +56,9 @@ impl FragmentHeader {
             return None;
         }
         Some(Self {
-            message_id: u16::from_be_bytes([data[0], data[1]]),
-            fragment_index: data[2],
-            fragment_count: data[3],
+            message_id: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
+            fragment_index: data[4],
+            fragment_count: data[5],
         })
     }
 }
@@ -67,7 +69,7 @@ pub const MAX_FRAGMENT_COUNT: usize = 255;
 
 /// Splits a message into fragments. Returns an error if the message requires too many fragments.
 pub fn fragment_message(
-    message_id: u16,
+    message_id: u32,
     data: &[u8],
     max_fragment_payload: usize,
 ) -> Result<Vec<Vec<u8>>, FragmentError> {
@@ -161,7 +163,7 @@ impl FragmentBuffer {
 /// Reassembles fragmented messages.
 #[derive(Debug)]
 pub struct FragmentAssembler {
-    buffers: HashMap<u16, FragmentBuffer>,
+    buffers: HashMap<u32, FragmentBuffer>,
     timeout: Duration,
     max_buffer_size: usize,
     current_buffer_size: usize,

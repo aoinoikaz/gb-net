@@ -241,6 +241,19 @@ impl NetClient {
 
     fn handle_packet(&mut self, packet: Packet, events: &mut Vec<ClientEvent>) {
         match (&self.state, packet.packet_type) {
+            (
+                ClientState::Connecting,
+                PacketType::ConnectionCookie {
+                    cookie_high,
+                    cookie_low,
+                },
+            ) => {
+                // Echo the cookie back in a ConnectionRequestWithCookie
+                self.send_raw(PacketType::ConnectionRequestWithCookie {
+                    cookie_high,
+                    cookie_low,
+                });
+            }
             (ClientState::Connecting, PacketType::ConnectionChallenge { server_salt }) => {
                 self.connection.set_server_salt(server_salt);
                 self.state = ClientState::ChallengeResponse;
@@ -325,7 +338,8 @@ impl NetClient {
                     }
                 }
             }
-            (ClientState::Connected, PacketType::KeepAlive) => {
+            (ClientState::Connected, PacketType::KeepAlive)
+            | (ClientState::Connected, PacketType::AckOnly) => {
                 self.connection.touch_recv_time();
                 self.connection.process_incoming_header(&packet.header);
             }

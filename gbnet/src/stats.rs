@@ -74,6 +74,7 @@ pub struct ChannelStats {
     pub pending_ack_count: usize,
     pub receive_buffer_size: usize,
     pub gap_sequences_skipped: u64,
+    pub messages_dropped: u64,
 }
 
 /// Reliability subsystem statistics: in-flight packets, RTT, loss, and evictions.

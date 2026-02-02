@@ -49,8 +49,12 @@ pub mod client;
 pub mod config;
 pub mod congestion;
 pub mod connection;
+pub mod delta;
 pub mod fragment;
+pub mod interest;
+pub mod interpolation;
 pub mod packet;
+pub mod priority;
 pub mod reliability;
 pub mod security;
 pub mod serialize;
@@ -67,7 +71,9 @@ mod tests;
 pub use channel::{Channel, ChannelError};
 pub use client::{ClientEvent, NetClient};
 pub use config::{ChannelConfig, ConfigError, DeliveryMode, NetworkConfig, SimulationConfig};
-pub use congestion::{BandwidthTracker, CongestionController, CongestionMode};
+pub use congestion::{
+    BandwidthTracker, CongestionController, CongestionMode, CongestionPhase, CongestionWindow,
+};
 pub use connection::{Connection, ConnectionError, ConnectionState, DisconnectReason};
 pub use fragment::{FragmentAssembler, FragmentError, FragmentHeader, MtuDiscovery};
 pub use packet::{Packet, PacketHeader, PacketType};
@@ -82,10 +88,16 @@ pub use stats::{
 };
 pub use util::{sequence_diff, sequence_greater_than};
 
-pub use gbnet_macros::NetworkSerialize;
+pub use gbnet_macros::{NetworkDelta, NetworkSerialize};
 
+pub use delta::{BaselineManager, BaselineSeq, DeltaTracker};
+pub use interest::{GridInterest, InterestManager, RadiusInterest};
+pub use interpolation::{Interpolatable, SnapshotBuffer};
+pub use priority::PriorityAccumulator;
 pub use serialize::bit_io::{BitBuffer, BitRead, BitWrite};
-pub use serialize::{BitDeserialize, BitSerialize, ByteAlignedDeserialize, ByteAlignedSerialize};
+pub use serialize::{
+    BitDeserialize, BitSerialize, ByteAlignedDeserialize, ByteAlignedSerialize, NetworkDelta,
+};
 pub use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Unified error type encompassing all GB-Net error variants.

@@ -223,6 +223,84 @@ impl ConnectionRateLimiter {
     }
 }
 
+/// Cookie size in bytes for stateless connection cookies.
+pub const COOKIE_SIZE: usize = 16;
+
+/// Generate a stateless cookie from client address, timestamp, and server secret.
+/// Uses a CRC32C chain to produce a 16-byte cookie without additional dependencies.
+pub fn generate_cookie(
+    addr: &SocketAddr,
+    timestamp_secs: u64,
+    secret: &[u8; 32],
+) -> [u8; COOKIE_SIZE] {
+    let mut data = Vec::new();
+    match addr.ip() {
+        IpAddr::V4(ip) => data.extend_from_slice(&ip.octets()),
+        IpAddr::V6(ip) => data.extend_from_slice(&ip.octets()),
+    }
+    data.extend_from_slice(&addr.port().to_le_bytes());
+    data.extend_from_slice(&timestamp_secs.to_le_bytes());
+    data.extend_from_slice(&secret[..16]);
+
+    let c0 = crc32c(&data);
+    data.extend_from_slice(&c0.to_le_bytes());
+    data.extend_from_slice(&secret[16..32]);
+    let c1 = crc32c(&data);
+
+    data.extend_from_slice(&c1.to_le_bytes());
+    let c2 = crc32c(&data);
+
+    data.extend_from_slice(&c2.to_le_bytes());
+    let c3 = crc32c(&data);
+
+    let mut cookie = [0u8; COOKIE_SIZE];
+    cookie[0..4].copy_from_slice(&c0.to_le_bytes());
+    cookie[4..8].copy_from_slice(&c1.to_le_bytes());
+    cookie[8..12].copy_from_slice(&c2.to_le_bytes());
+    cookie[12..16].copy_from_slice(&c3.to_le_bytes());
+    cookie
+}
+
+/// Validate a stateless cookie against the expected value for an address.
+/// Checks the current timestamp window and one previous window to handle clock skew.
+pub fn validate_cookie(
+    cookie: &[u8; COOKIE_SIZE],
+    addr: &SocketAddr,
+    current_timestamp_secs: u64,
+    secret: &[u8; 32],
+    window_secs: u64,
+) -> bool {
+    // Check current window
+    let current_window = current_timestamp_secs / window_secs;
+    let expected = generate_cookie(addr, current_window, secret);
+    if cookie == &expected {
+        return true;
+    }
+    // Check previous window for clock skew tolerance
+    if current_window > 0 {
+        let prev_expected = generate_cookie(addr, current_window - 1, secret);
+        if cookie == &prev_expected {
+            return true;
+        }
+    }
+    false
+}
+
+/// Convert a 16-byte cookie into (high, low) u64 pair for wire encoding.
+pub fn cookie_to_u64_pair(cookie: &[u8; COOKIE_SIZE]) -> (u64, u64) {
+    let high = u64::from_le_bytes(cookie[0..8].try_into().unwrap());
+    let low = u64::from_le_bytes(cookie[8..16].try_into().unwrap());
+    (high, low)
+}
+
+/// Convert (high, low) u64 pair back into a 16-byte cookie.
+pub fn cookie_from_u64_pair(high: u64, low: u64) -> [u8; COOKIE_SIZE] {
+    let mut cookie = [0u8; COOKIE_SIZE];
+    cookie[0..8].copy_from_slice(&high.to_le_bytes());
+    cookie[8..16].copy_from_slice(&low.to_le_bytes());
+    cookie
+}
+
 /// AES-256-GCM authenticated encryption (requires `encryption` feature).
 /// Nonce is derived from the packet sequence number for replay protection.
 #[cfg(feature = "encryption")]
@@ -290,10 +368,11 @@ impl EncryptionState {
 
     fn make_nonce(&self, sequence: u64) -> [u8; AES_GCM_NONCE_LEN] {
         let mut nonce = [0u8; AES_GCM_NONCE_LEN];
-        nonce[..8].copy_from_slice(&sequence.to_le_bytes());
-        let salt_bytes = self.connection_salt.to_le_bytes();
-        // Mix connection salt into nonce bytes 8..12 to differentiate connections
-        nonce[8..12].copy_from_slice(&salt_bytes[..4]);
+        // XOR full 8-byte salt with 8-byte sequence for nonce bytes [0..8],
+        // using all 64 bits of salt entropy. Bytes [8..12] remain zero for
+        // domain separation.
+        let xored = sequence ^ self.connection_salt;
+        nonce[..8].copy_from_slice(&xored.to_le_bytes());
         nonce
     }
 }

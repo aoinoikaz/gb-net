@@ -37,6 +37,9 @@ pub const DEFAULT_MAX_PENDING: usize = 256;
 pub const DEFAULT_ORDERED_BUFFER_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_MAX_ORDERED_BUFFER_SIZE: usize = 1024;
 pub const DEFAULT_RATE_LIMIT_PER_SECOND: usize = 10;
+pub const DEFAULT_COOKIE_WINDOW_SECS: u64 = 5;
+pub const DEFAULT_DELTA_BASELINE_TIMEOUT_SECS: u64 = 2;
+pub const DEFAULT_MAX_BASELINE_SNAPSHOTS: usize = 32;
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 pub const DEFAULT_MAX_TRACKED_TOKENS: usize = 4096;
 pub const DEFAULT_CHANNEL_PRIORITY: u8 = 128;
@@ -202,6 +205,14 @@ pub struct NetworkConfig {
     pub max_bandwidth_bytes_per_sec: usize,
     pub max_pending: usize,
     pub rate_limit_per_second: usize,
+
+    pub enable_stateless_cookie: bool,
+    pub use_cwnd_congestion: bool,
+
+    pub delta_baseline_timeout: Duration,
+    pub max_baseline_snapshots: usize,
+
+    pub enable_connection_migration: bool,
 }
 
 fn is_valid_positive_f32(v: f32) -> bool {
@@ -367,6 +378,14 @@ impl Default for NetworkConfig {
             max_pending: DEFAULT_MAX_PENDING,
 
             rate_limit_per_second: DEFAULT_RATE_LIMIT_PER_SECOND,
+
+            enable_stateless_cookie: true,
+            use_cwnd_congestion: false,
+
+            delta_baseline_timeout: Duration::from_secs(DEFAULT_DELTA_BASELINE_TIMEOUT_SECS),
+            max_baseline_snapshots: DEFAULT_MAX_BASELINE_SNAPSHOTS,
+
+            enable_connection_migration: false,
         }
     }
 }

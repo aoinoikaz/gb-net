@@ -56,6 +56,10 @@ impl Connection {
                     .update(self.stats.packet_loss, self.stats.rtt);
                 self.congestion.refill_budget(self.config.mtu);
 
+                if let Some(ref mut cw) = self.cwnd {
+                    cw.update_pacing(self.reliability.rto());
+                }
+
                 let time_since_send = now.duration_since(self.last_packet_send_time);
                 if time_since_send > self.config.keepalive_interval {
                     self.send_keepalive()?;
@@ -74,6 +78,7 @@ impl Connection {
                     self.send_queue.push_back(packet);
                 }
 
+                self.data_sent_this_tick = false;
                 let mut packets_sent_this_cycle: u32 = 0;
                 let priority_order = self.channel_priority_order.clone();
                 for &ch_idx in &priority_order {
@@ -84,6 +89,12 @@ impl Connection {
                             .can_send(packets_sent_this_cycle, estimated_size)
                         {
                             break;
+                        }
+                        // Check cwnd-based congestion if enabled
+                        if let Some(ref cw) = self.cwnd {
+                            if !cw.can_send(estimated_size) || !cw.can_send_paced(now) {
+                                break;
+                            }
                         }
                         let Some((msg_seq, wire_data)) =
                             self.channels[ch_idx].get_outgoing_message()
@@ -97,13 +108,17 @@ impl Connection {
                         let pkt_seq = header.sequence;
 
                         if wire_data.len() > self.config.fragment_threshold {
+                            let frag_id = self.next_fragment_id;
+                            self.next_fragment_id = self.next_fragment_id.wrapping_add(1);
                             if let Ok(fragments) = crate::fragment::fragment_message(
-                                msg_seq,
+                                frag_id,
                                 &wire_data,
                                 self.config.fragment_threshold,
                             ) {
-                                for frag_data in fragments {
+                                let mut frag_entries = Vec::with_capacity(fragments.len());
+                                for (frag_idx, frag_data) in fragments.into_iter().enumerate() {
                                     let frag_header = self.create_header();
+                                    let frag_pkt_seq = frag_header.sequence;
                                     let packet = Packet::new(
                                         frag_header,
                                         PacketType::Payload {
@@ -111,9 +126,11 @@ impl Connection {
                                             is_fragment: true,
                                         },
                                     )
-                                    .with_payload(frag_data);
+                                    .with_payload(frag_data.clone());
                                     self.send_queue.push_back(packet);
+                                    frag_entries.push((frag_pkt_seq, frag_idx as u8, frag_data));
                                 }
+                                self.pending_fragments.insert(frag_id, frag_entries);
                             }
                         } else {
                             let packet = Packet::new(
@@ -127,6 +144,10 @@ impl Connection {
                             self.send_queue.push_back(packet);
                         }
 
+                        self.data_sent_this_tick = true;
+                        if let Some(ref mut cw) = self.cwnd {
+                            cw.on_send(packet_size);
+                        }
                         if self.channels[ch_idx].is_reliable() {
                             self.reliability.on_packet_sent(
                                 pkt_seq,
@@ -157,6 +178,14 @@ impl Connection {
                 for channel in &mut self.channels {
                     channel.update();
                 }
+
+                // Emit AckOnly if we have pending acks but didn't send any data this tick
+                if self.pending_ack_send && !self.data_sent_this_tick {
+                    let header = self.create_header();
+                    let packet = Packet::new(header, PacketType::AckOnly);
+                    self.send_queue.push_back(packet);
+                }
+                self.pending_ack_send = false;
 
                 self.mtu_discovery.check_probe_timeout();
             }

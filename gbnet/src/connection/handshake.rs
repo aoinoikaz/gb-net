@@ -143,6 +143,10 @@ impl Connection {
         self.recv_queue.clear();
         self.disconnect_time = None;
         self.disconnect_retry_count = 0;
+        self.pending_ack_send = false;
+        self.data_sent_this_tick = false;
+        self.next_fragment_id = 0;
+        self.pending_fragments.clear();
 
         for channel in &mut self.channels {
             channel.reset();

@@ -6,20 +6,24 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Result of processing ACKs: (acked channel pairs, fast retransmit candidates).
+pub type AckResult = (SmallVec<[(u8, u16); 8]>, SmallVec<[(u8, u16); 4]>);
+
 pub const INITIAL_RTO_MILLIS: u64 = 100;
-pub const ACK_BITS_WINDOW: u16 = 32;
+pub const ACK_BITS_WINDOW: u16 = 64;
 pub const RTT_ALPHA: f64 = 0.125;
 pub const RTT_BETA: f64 = 0.25;
 pub const MIN_RTO_MS: f64 = 50.0;
 pub const MAX_RTO_MS: f64 = 2000.0;
 const LOSS_WINDOW_SIZE: usize = 256;
+pub const FAST_RETRANSMIT_THRESHOLD: u8 = 3;
 
 /// Tracks sent packets for reliability and acknowledgment.
 #[derive(Debug)]
 pub struct ReliableEndpoint {
     local_sequence: u16,
     remote_sequence: u16,
-    ack_bits: u32,
+    ack_bits: u64,
 
     sent_packets: HashMap<u16, SentPacketRecord>,
     received_packets: SequenceBuffer<bool>,
@@ -50,6 +54,7 @@ struct SentPacketRecord {
     channel_sequence: u16,
     send_time: Instant,
     size: usize,
+    nack_count: u8,
 }
 
 impl ReliableEndpoint {
@@ -110,6 +115,7 @@ impl ReliableEndpoint {
                 channel_sequence,
                 send_time,
                 size,
+                nack_count: 0,
             },
         );
         self.total_packets_sent += 1;
@@ -126,7 +132,7 @@ impl ReliableEndpoint {
 
         if let Some(seq) = worst_seq {
             self.sent_packets.remove(&seq);
-            self.record_loss_sample(true);
+            // Eviction is buffer management, not network loss — don't record a loss sample
             self.total_packets_lost += 1;
             self.packets_evicted += 1;
         }
@@ -143,16 +149,16 @@ impl ReliableEndpoint {
             self.received_packets.insert(sequence, true);
 
             if sequence_greater_than(sequence, self.remote_sequence) {
-                let diff = sequence_diff(sequence, self.remote_sequence) as u32;
-                if diff <= ACK_BITS_WINDOW as u32 {
+                let diff = sequence_diff(sequence, self.remote_sequence) as u64;
+                if diff <= ACK_BITS_WINDOW as u64 {
                     self.ack_bits = (self.ack_bits << diff) | (1 << (diff - 1));
                 } else {
                     self.ack_bits = 0;
                 }
                 self.remote_sequence = sequence;
             } else {
-                let diff = sequence_diff(self.remote_sequence, sequence) as u32;
-                if diff > 0 && diff <= ACK_BITS_WINDOW as u32 {
+                let diff = sequence_diff(self.remote_sequence, sequence) as u64;
+                if diff > 0 && diff <= ACK_BITS_WINDOW as u64 {
                     self.ack_bits |= 1 << (diff - 1);
                 }
             }
@@ -160,24 +166,61 @@ impl ReliableEndpoint {
     }
 
     /// Processes acknowledgments from the remote endpoint.
-    /// Returns a list of (channel_id, channel_sequence) pairs for acked packets.
-    pub fn process_acks(&mut self, ack: u16, ack_bits: u32) -> SmallVec<[(u8, u16); 8]> {
+    /// Returns (acked_pairs, fast_retransmit_candidates).
+    /// Acked pairs are (channel_id, channel_sequence) for acknowledged packets.
+    /// Fast retransmit candidates are (channel_id, channel_sequence) for packets
+    /// that have been NACKed enough times to trigger fast retransmit.
+    pub fn process_acks(&mut self, ack: u16, ack_bits: u64) -> AckResult {
         let mut acked = SmallVec::new();
 
-        if let Some(pair) = self.ack_single(ack) {
-            acked.push(pair);
+        // Collect all acked sequence numbers
+        let mut acked_seqs: SmallVec<[u16; 16]> = SmallVec::new();
+        if self.sent_packets.contains_key(&ack) {
+            acked_seqs.push(ack);
         }
-
         for i in 0..ACK_BITS_WINDOW {
             if (ack_bits & (1 << i)) != 0 {
-                let acked_seq = ack.wrapping_sub(i + 1);
-                if let Some(pair) = self.ack_single(acked_seq) {
-                    acked.push(pair);
+                let seq = ack.wrapping_sub(i + 1);
+                if self.sent_packets.contains_key(&seq) {
+                    acked_seqs.push(seq);
                 }
             }
         }
 
-        acked
+        // Process acks
+        for &seq in &acked_seqs {
+            if let Some(pair) = self.ack_single(seq) {
+                acked.push(pair);
+            }
+        }
+
+        // Increment nack_count for in-flight packets older than ack that are NOT in ack_bits
+        let mut fast_retransmit = SmallVec::new();
+        let in_flight_seqs: SmallVec<[u16; 32]> = self.sent_packets.keys().copied().collect();
+        for seq in in_flight_seqs {
+            // Only consider packets older than ack
+            if !sequence_greater_than(ack, seq) {
+                continue;
+            }
+            let diff = sequence_diff(ack, seq);
+            if diff <= 0 || diff > ACK_BITS_WINDOW as i32 {
+                continue;
+            }
+            // Check if this seq is covered by ack_bits
+            let bit_index = diff as u64 - 1;
+            if (ack_bits & (1 << bit_index)) != 0 {
+                continue;
+            }
+            // Not acked — increment nack
+            if let Some(record) = self.sent_packets.get_mut(&seq) {
+                record.nack_count = record.nack_count.saturating_add(1);
+                if record.nack_count == FAST_RETRANSMIT_THRESHOLD {
+                    fast_retransmit.push((record.channel_id, record.channel_sequence));
+                }
+            }
+        }
+
+        (acked, fast_retransmit)
     }
 
     fn ack_single(&mut self, sequence: u16) -> Option<(u8, u16)> {
@@ -219,7 +262,7 @@ impl ReliableEndpoint {
     }
 
     /// Gets current ack information to include in outgoing packets.
-    pub fn get_ack_info(&self) -> (u16, u32) {
+    pub fn get_ack_info(&self) -> (u16, u64) {
         (self.remote_sequence, self.ack_bits)
     }
 
@@ -243,6 +286,11 @@ impl ReliableEndpoint {
             .filter(|&&l| l)
             .count();
         lost as f32 / self.loss_window_count as f32
+    }
+
+    /// Returns true if the given packet sequence is still in-flight (not yet acked).
+    pub fn is_in_flight(&self, sequence: u16) -> bool {
+        self.sent_packets.contains_key(&sequence)
     }
 
     pub fn packets_in_flight(&self) -> usize {
@@ -485,7 +533,7 @@ mod tests {
         endpoint.on_packet_sent(11, now, 3, 7, 200);
 
         // ACK packet 10 directly, packet 11 via ack_bits
-        let acked = endpoint.process_acks(11, 1); // bit 0 = seq 10
+        let (acked, _fast_retransmit) = endpoint.process_acks(11, 1); // bit 0 = seq 10
         assert_eq!(acked.len(), 2);
         // Should contain both (3, 7) for seq 11 and (2, 5) for seq 10
         assert!(acked.contains(&(3, 7)));
