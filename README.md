@@ -115,6 +115,26 @@ let mut buf = BitBuffer::new();
 update.bit_serialize(&mut buf)?;
 ```
 
+### Configuration
+
+```rust
+use gbnet::{NetworkConfig, ChannelConfig, DeliveryMode};
+use std::time::Duration;
+
+let config = NetworkConfig::default()
+    .with_protocol_id(0xDEADBEEF)
+    .with_max_clients(32)
+    .with_mtu(1200)
+    .with_connection_timeout(Duration::from_secs(10))
+    .with_keepalive_interval(Duration::from_secs(1))
+    .with_send_rate(60.0)
+    .with_max_in_flight(256)
+    // Per-channel delivery modes
+    .with_channel_config(0, ChannelConfig::reliable_ordered().with_priority(0))
+    .with_channel_config(1, ChannelConfig::unreliable().with_priority(128))
+    .with_channel_config(2, ChannelConfig::reliable_sequenced().with_priority(64));
+```
+
 ---
 
 ## Delivery Modes
@@ -136,14 +156,15 @@ Per-message reliability override is supported — send a reliable message on an 
 | | |
 |---|---|
 | **Serialization** | Bitpacked encoding, derive macro, field-level `#[bits = N]` control, byte-aligned mode |
-| **Reliability** | Jacobson/Karels RTT, fast retransmit (3 dup ACKs), progressive backoff |
-| **Fragmentation** | Auto split/reassembly, per-message timeout, memory-bounded buffers |
-| **MTU Discovery** | Binary search probing between min and max MTU |
-| **Security** | CRC32C integrity, challenge-response handshake, rate limiting, AES-256-GCM encryption (optional) |
+| **Reliability** | Jacobson/Karels RTT, channel-owned retransmission with exponential backoff, bounded in-flight tracking |
+| **Fragmentation** | Auto split/reassembly when payload exceeds threshold, per-message timeout, memory-bounded buffers |
+| **MTU Discovery** | Binary search probing with automatic probe timeout detection |
+| **Security** | CRC32C integrity, challenge-response handshake, IP-based rate limiting, deserialization bounds checking, AES-256-GCM encryption with per-connection nonce salt (optional) |
 | **Congestion** | Binary good/bad mode, packet loss + RTT monitoring, send rate limiting |
 | **Batching** | Pack multiple small messages into single UDP packets |
 | **Simulation** | Configurable loss, latency, jitter, duplicates, reordering, bandwidth limits |
 | **Diagnostics** | Per-connection RTT, packet loss %, bandwidth up/down, channel stats, connection quality |
+| **Disconnect** | Reliable disconnect with configurable retry and backoff (client and server) |
 | **Reconnection** | Client-side `reconnect()` with full state reset and new handshake |
 
 ---
@@ -207,6 +228,20 @@ gbnet_macros/
 └── src/
     └── lib.rs              # #[derive(NetworkSerialize)]
 ```
+
+---
+
+## Examples
+
+Run any example with `cargo run --example <name>`:
+
+| Example | Description |
+|---|---|
+| `echo_server` | Minimal server that reflects all messages back |
+| `echo_client` | Connects, sends a message, prints the echo reply, disconnects |
+| `channels` | Demonstrates all 5 delivery modes side by side |
+| `serialization` | Bitpacked serialize/deserialize round-trip with `#[bits = N]` |
+| `configuration` | Custom config with multiple channel types and tuning |
 
 ---
 
