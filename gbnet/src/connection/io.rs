@@ -80,8 +80,8 @@ impl Connection {
 
                 self.data_sent_this_tick = false;
                 let mut packets_sent_this_cycle: u32 = 0;
-                let priority_order = self.channel_priority_order.clone();
-                for &ch_idx in &priority_order {
+                for ch_idx_ref in 0..self.channel_priority_order.len() {
+                    let ch_idx = self.channel_priority_order[ch_idx_ref];
                     loop {
                         let estimated_size = self.config.mtu;
                         if !self
@@ -140,7 +140,7 @@ impl Connection {
                                     is_fragment: false,
                                 },
                             )
-                            .with_payload(wire_data.clone());
+                            .with_payload(wire_data);
                             self.send_queue.push_back(packet);
                         }
 

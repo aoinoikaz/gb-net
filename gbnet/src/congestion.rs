@@ -501,4 +501,127 @@ mod tests {
         // Recovery time should have doubled
         assert!(cc.adaptive_recovery_secs() > initial_recovery);
     }
+
+    #[test]
+    fn test_cwnd_growth_on_ack_slow_start() {
+        let mtu = 1200;
+        let mut cw = CongestionWindow::new(mtu);
+        let initial_cwnd = cw.cwnd();
+        assert_eq!(cw.phase(), CongestionPhase::SlowStart);
+
+        cw.on_ack(mtu);
+        assert!(
+            cw.cwnd() > initial_cwnd,
+            "cwnd should grow on ack in slow start: {} vs {}",
+            cw.cwnd(),
+            initial_cwnd
+        );
+        // In slow start, cwnd grows by the acked bytes
+        assert!(
+            (cw.cwnd() - (initial_cwnd + mtu as f64)).abs() < f64::EPSILON,
+            "cwnd should grow by acked bytes in slow start"
+        );
+    }
+
+    #[test]
+    fn test_cwnd_growth_on_ack_avoidance() {
+        let mtu = 1200;
+        let mut cw = CongestionWindow::new(mtu);
+
+        // Force into avoidance by setting ssthresh low and acking past it
+        cw.on_loss(); // sets ssthresh = cwnd/2, enters recovery
+        cw.exit_recovery(); // enters avoidance
+        assert_eq!(cw.phase(), CongestionPhase::Avoidance);
+
+        let cwnd_before = cw.cwnd();
+        cw.on_ack(mtu);
+        let cwnd_after = cw.cwnd();
+
+        // Additive increase: cwnd += mtu * bytes / cwnd (much smaller than slow start)
+        let expected_increase = (mtu as f64) * (mtu as f64) / cwnd_before;
+        assert!(
+            (cwnd_after - cwnd_before - expected_increase).abs() < 1.0,
+            "Avoidance growth should be additive: delta={}, expected={}",
+            cwnd_after - cwnd_before,
+            expected_increase
+        );
+    }
+
+    #[test]
+    fn test_cwnd_shrink_on_loss() {
+        let mtu = 1200;
+        let mut cw = CongestionWindow::new(mtu);
+        let initial_cwnd = cw.cwnd();
+
+        cw.on_loss();
+        assert_eq!(cw.phase(), CongestionPhase::Recovery);
+        assert!(
+            cw.cwnd() < initial_cwnd,
+            "cwnd should shrink on loss: {} vs {}",
+            cw.cwnd(),
+            initial_cwnd
+        );
+        // cwnd should be halved (clamped to min)
+        let expected = (initial_cwnd / 2.0).max(MIN_CWND_BYTES as f64);
+        assert!(
+            (cw.cwnd() - expected).abs() < f64::EPSILON,
+            "cwnd should be halved on loss: {} vs {}",
+            cw.cwnd(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_cwnd_ssthresh_transition() {
+        let mtu = 1200;
+        let mut cw = CongestionWindow::new(mtu);
+        assert_eq!(cw.phase(), CongestionPhase::SlowStart);
+
+        // Grow cwnd in slow start, then trigger loss to set finite ssthresh
+        for _ in 0..20 {
+            cw.on_ack(mtu);
+        }
+        assert_eq!(cw.phase(), CongestionPhase::SlowStart); // ssthresh is MAX initially
+        let cwnd_before_loss = cw.cwnd();
+
+        cw.on_loss(); // ssthresh = cwnd/2, cwnd = ssthresh, enters recovery
+        assert_eq!(cw.phase(), CongestionPhase::Recovery);
+        let ssthresh = cw.cwnd();
+        assert!(
+            (ssthresh - cwnd_before_loss / 2.0).abs() < 1.0,
+            "ssthresh should be half of pre-loss cwnd"
+        );
+
+        cw.exit_recovery();
+        assert_eq!(cw.phase(), CongestionPhase::Avoidance);
+
+        // Acking in avoidance should keep us in avoidance (cwnd grows slowly)
+        cw.on_ack(mtu);
+        assert_eq!(cw.phase(), CongestionPhase::Avoidance);
+    }
+
+    #[test]
+    fn test_cwnd_can_send_and_pacing() {
+        let mtu = 1200;
+        let mut cw = CongestionWindow::new(mtu);
+
+        assert!(cw.can_send(mtu));
+        assert_eq!(cw.bytes_in_flight(), 0);
+
+        // Fill the window
+        let cwnd_bytes = cw.cwnd() as usize;
+        let packets = cwnd_bytes / mtu;
+        for _ in 0..packets {
+            cw.on_send(mtu);
+        }
+        // Should no longer be able to send
+        assert!(
+            !cw.can_send(mtu),
+            "Should not be able to send when window is full"
+        );
+
+        // Ack some to free space
+        cw.on_ack(mtu);
+        assert!(cw.can_send(mtu));
+    }
 }

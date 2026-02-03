@@ -132,8 +132,7 @@ impl ReliableEndpoint {
 
         if let Some(seq) = worst_seq {
             self.sent_packets.remove(&seq);
-            // Eviction is buffer management, not network loss — don't record a loss sample
-            self.total_packets_lost += 1;
+            // Eviction is buffer management, not network loss — don't inflate loss stats
             self.packets_evicted += 1;
         }
     }
@@ -538,5 +537,35 @@ mod tests {
         // Should contain both (3, 7) for seq 11 and (2, 5) for seq 10
         assert!(acked.contains(&(3, 7)));
         assert!(acked.contains(&(2, 5)));
+    }
+
+    #[test]
+    fn test_eviction_does_not_inflate_loss() {
+        let mut endpoint = ReliableEndpoint::new(256).with_max_in_flight(4);
+        let now = Instant::now();
+
+        // Record baseline loss
+        let loss_before = endpoint.packet_loss_percent();
+        let stats_before = endpoint.stats();
+
+        // Fill to capacity and trigger evictions
+        for i in 0..8u16 {
+            endpoint.on_packet_sent(i, now, 0, i, 100);
+        }
+        // 4 evictions should have occurred (8 sent, max 4 in-flight)
+        assert_eq!(endpoint.packets_evicted(), 4);
+
+        // Loss stats should not have been inflated by evictions
+        let stats_after = endpoint.stats();
+        assert_eq!(
+            stats_after.total_lost, stats_before.total_lost,
+            "Evictions should not increment total_lost: before={}, after={}",
+            stats_before.total_lost, stats_after.total_lost
+        );
+        assert_eq!(
+            endpoint.packet_loss_percent(),
+            loss_before,
+            "Evictions should not affect packet loss percentage"
+        );
     }
 }

@@ -117,7 +117,9 @@ impl NetServer {
         let mut disconnected = Vec::new();
         let addrs: Vec<SocketAddr> = self.connections.keys().copied().collect();
         for addr in addrs {
-            let conn = self.connections.get_mut(&addr).unwrap();
+            let Some(conn) = self.connections.get_mut(&addr) else {
+                continue;
+            };
 
             if let Err(_e) = conn.update_tick() {
                 disconnected.push((addr, DisconnectReason::Timeout));
@@ -132,16 +134,18 @@ impl NetServer {
                     let byte_len = data_with_crc.len();
                     if let Err(e) = self.socket.send_to(&data_with_crc, addr) {
                         log::warn!("Failed to send to {}: {:?}", addr, e);
-                        let conn = self.connections.get_mut(&addr).unwrap();
-                        conn.stats.send_errors += 1;
-                    } else {
-                        let conn = self.connections.get_mut(&addr).unwrap();
+                        if let Some(conn) = self.connections.get_mut(&addr) {
+                            conn.stats.send_errors += 1;
+                        }
+                    } else if let Some(conn) = self.connections.get_mut(&addr) {
                         conn.record_bytes_sent(byte_len);
                     }
                 }
             }
 
-            let conn = self.connections.get_mut(&addr).unwrap();
+            let Some(conn) = self.connections.get_mut(&addr) else {
+                continue;
+            };
             let max_channels = conn.channel_count();
             for ch in 0..max_channels as u8 {
                 while let Some(data) = conn.receive(ch) {
@@ -473,7 +477,9 @@ impl NetServer {
                 } else {
                     return;
                 };
-                let conn = self.connections.get_mut(&effective_addr).unwrap();
+                let Some(conn) = self.connections.get_mut(&effective_addr) else {
+                    return;
+                };
                 if packet.payload.len() > conn.config().default_channel_config.max_message_size {
                     return;
                 }
