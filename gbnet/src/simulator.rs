@@ -80,7 +80,8 @@ impl NetworkSimulator {
             });
         }
 
-        if self.config.duplicate_chance > 0.0 && rng.random::<f32>() < self.config.duplicate_chance {
+        if self.config.duplicate_chance > 0.0 && rng.random::<f32>() < self.config.duplicate_chance
+        {
             let dup_delay = Duration::from_millis((delay_ms + rng.random_range(0.0..20.0)) as u64);
             self.delayed_packets.push_back(DelayedPacket {
                 data: data.to_vec(),

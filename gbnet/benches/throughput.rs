@@ -1,8 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use gbnet::{
     BitBuffer, BitDeserialize, BitSerialize, Channel, ChannelConfig, NetworkSerialize, Packet,
     PacketHeader, PacketType,
 };
+use std::hint::black_box;
 
 #[derive(NetworkSerialize, Debug, PartialEq)]
 struct PlayerUpdate {
